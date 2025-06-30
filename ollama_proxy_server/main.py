@@ -13,177 +13,314 @@ from urllib.parse import urlparse, parse_qs
 from queue import Queue
 import requests
 import argparse
-from ascii_colors import ASCIIColors
 from pathlib import Path
 import csv
 import datetime
+import threading
+
+
+SERVERS_CONFIG = []
+AUTHORIZED_USERS = {}
+CONFIG_FILE_PATH = "config.info"
+USERS_FILE_PATH = "authorized_users.txt"
+LOG_FILE_PATH = "access_log.txt"
+DEACTIVATE_SECURITY = False
+
+
+try:
+    from gui import launch_gui
+    GUI_AVAILABLE = True
+except ImportError as e:
+    print(f"Could not import GUI module: {e}. GUI will not be available.")
+    GUI_AVAILABLE = False
+    def launch_gui(port):
+        print("GUI module not found. GUI cannot be started.")
+
 
 def get_config(filename):
     config = configparser.ConfigParser()
+    if not Path(filename).exists():
+        print(f"Config file {filename} not found. No servers will be loaded.")
+        return []
     config.read(filename)
-    return [(name, {'url': config[name]['url'], 'queue': Queue()}) for name in config.sections()]
+    parsed_servers = []
+    for name in config.sections():
+        try:
+            parsed_servers.append((name, {'url': config[name]['url'], 'queue': Queue()}))
+        except KeyError:
+            print(f"Server entry '{name}' in {filename} is missing 'url'. Skipping.")
+    return parsed_servers
 
-# Read the authorized users and their keys from a file
+
 def get_authorized_users(filename):
+    authorized_users = {}
+    if not Path(filename).exists():
+        print(f"Authorized users file {filename} not found. No users will be loaded.")
+        return authorized_users
+
     with open(filename, 'r') as f:
         lines = f.readlines()
-    authorized_users = {}
     for line in lines:
-        if line=="":
+        if line.strip() == "":
             continue
         try:
-            user, key = line.strip().split(':')
+            user, key = line.strip().split(':', 1) # Split only on the first colon
             authorized_users[user] = key
-        except:
-            ASCIIColors.red(f"User entry broken:{line.strip()}")
+        except ValueError:
+            print(f"User entry broken (format: user:key): {line.strip()}")
     return authorized_users
 
 
+class RequestHandler(BaseHTTPRequestHandler):
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default="config.ini", help='Path to the authorized users list')
-    parser.add_argument('--log_path', default="access_log.txt", help='Path to the access log file')
-    parser.add_argument('--users_list', default="authorized_users.txt", help='Path to the config file')
-    parser.add_argument('--port', type=int, default=8000, help='Port number for the server')
-    parser.add_argument('-d', '--deactivate_security', action='store_true', help='Deactivates security')
-    args = parser.parse_args()
-    servers = get_config(args.config)  
-    authorized_users = get_authorized_users(args.users_list)
-    deactivate_security = args.deactivate_security
-    ASCIIColors.red("Ollama Proxy server")
-    ASCIIColors.red("Author: ParisNeo")
+    def add_access_log_entry(self, event, user, ip_address, access, server, nb_queued_requests_on_server, error=""):
+        # Uses global LOG_FILE_PATH
+        log_file_path_obj = Path(LOG_FILE_PATH)
 
-    class RequestHandler(BaseHTTPRequestHandler):
-        def add_access_log_entry(self, event, user, ip_address, access, server, nb_queued_requests_on_server, error=""):
-            log_file_path = Path(args.log_path)
-        
-            if not log_file_path.exists():
-                with open(log_file_path, mode='w', newline='') as csvfile:
-                    fieldnames = ['time_stamp', 'event', 'user_name', 'ip_address', 'access', 'server', 'nb_queued_requests_on_server', 'error']
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-        
-            with open(log_file_path, mode='a', newline='') as csvfile:
+        if not log_file_path_obj.exists():
+            with open(log_file_path_obj, mode='w', newline='') as csvfile:
                 fieldnames = ['time_stamp', 'event', 'user_name', 'ip_address', 'access', 'server', 'nb_queued_requests_on_server', 'error']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                row = {'time_stamp': str(datetime.datetime.now()), 'event':event, 'user_name': user, 'ip_address': ip_address, 'access': access, 'server': server, 'nb_queued_requests_on_server': nb_queued_requests_on_server, 'error': error}
-                writer.writerow(row)
+                writer.writeheader()
 
-        def _send_response(self, response):
-            self.send_response(response.status_code)
-            for key, value in response.headers.items():
-                if key.lower() not in ['content-length', 'transfer-encoding', 'content-encoding']:
-                    self.send_header(key, value)
-            self.end_headers()
+        with open(log_file_path_obj, mode='a', newline='') as csvfile:
+            fieldnames = ['time_stamp', 'event', 'user_name', 'ip_address', 'access', 'server', 'nb_queued_requests_on_server', 'error']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            row = {'time_stamp': str(datetime.datetime.now()), 'event':event, 'user_name': user, 'ip_address': ip_address, 'access': access, 'server': server, 'nb_queued_requests_on_server': nb_queued_requests_on_server, 'error': error}
+            writer.writerow(row)
 
-            try:
-                # Read the full content to avoid chunking issues
-                content = response.content
+    def _send_response(self, response):
+        self.send_response(response.status_code)
+        for key, value in response.headers.items():
+            if key.lower() not in ['content-length', 'transfer-encoding', 'content-encoding']:
+                self.send_header(key, value)
+        self.end_headers()
+
+        try:
+            content = response.content
+            if hasattr(response, 'iter_content'):
+                for chunk in response.iter_content(chunk_size=8192):
+                    self.wfile.write(chunk)
+            else:
                 self.wfile.write(content)
-                self.wfile.flush()
-            except BrokenPipeError:
-                pass
+            self.wfile.flush()
+        except BrokenPipeError:
+            print(f"Broken pipe error for {self.client_address}")
+            pass
+        except Exception as e:
+            print(f"Error sending response content: {e}")
 
-        def do_HEAD(self):
-            self.log_request()
-            self.proxy()
+    def do_HEAD(self):
+        self.log_request()
+        self.proxy()
 
-        def do_GET(self):
-            self.log_request()
-            self.proxy()
+    def do_GET(self):
+        self.log_request()
+        self.proxy()
 
-        def do_POST(self):
-            self.log_request()
-            self.proxy()
+    def do_POST(self):
+        self.log_request()
+        self.proxy()
 
-        def _validate_user_and_key(self):
+    def _validate_user_and_key(self):
+        try:
+            auth_header = self.headers.get('Authorization')
+            if not auth_header or not auth_header.startswith('Bearer '):
+                return False
+            token = auth_header.split(' ')[1]
+            user, key = token.split(':', 1)
+
+            if AUTHORIZED_USERS.get(user) == key:
+                self.user = user
+                return True
+            else:
+                self.user = "unknown (failed_auth)"
+            return False
+        except Exception as e:
+            print(f"Auth validation error: {e}")
+            self.user = "unknown (auth_error)"
+            return False
+
+    def proxy(self):
+        self.user = "unknown"
+        client_ip, client_port = self.client_address
+        if not DEACTIVATE_SECURITY and not self._validate_user_and_key():
+            print(f'User is not authorized from {client_ip}:{client_port}')
+            auth_header = self.headers.get('Authorization')
+            token_info = "No token"
+            if auth_header and auth_header.startswith('Bearer '):
+                token_info = auth_header.split(' ')[1]
+            self.add_access_log_entry(event='rejected', user=token_info, ip_address=client_ip, access="Denied", server="None", nb_queued_requests_on_server=-1, error="Authentication failed")
+            self.send_response(403)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Forbidden: Authentication failed"}).encode('utf-8'))
+            return
+
+        url = urlparse(self.path)
+        path = url.path
+        get_params = parse_qs(url.query) or {}
+
+        post_data = b''
+        if self.command == "POST":
             try:
-                # Extract the bearer token from the headers
-                auth_header = self.headers.get('Authorization')
-                if not auth_header or not auth_header.startswith('Bearer '):
-                    return False
-                token       = auth_header.split(' ')[1]
-                user, key   = token.split(':')
-                
-                # Check if the user and key are in the list of authorized users
-                if authorized_users.get(user) == key:
-                    self.user = user
-                    return True
-                else:
-                    self.user = "unknown"
-                return False
-            except:
-                return False
-                
-        def proxy(self):
-            self.user = "unknown"
-            if not deactivate_security and not self._validate_user_and_key():
-                ASCIIColors.red(f'User is not authorized')
-                client_ip, client_port = self.client_address
-                # Extract the bearer token from the headers
-                auth_header = self.headers.get('Authorization')
-                if not auth_header or not auth_header.startswith('Bearer '):
-                    self.add_access_log_entry(event='rejected', user="unknown", ip_address=client_ip, access="Denied", server="None", nb_queued_requests_on_server=-1, error="Authentication failed")
-                else:
-                    token = auth_header.split(' ')[1]                
-                    self.add_access_log_entry(event='rejected', user=token, ip_address=client_ip, access="Denied", server="None", nb_queued_requests_on_server=-1, error="Authentication failed")
-                self.send_response(403)
-                self.end_headers()
-                return            
-            url = urlparse(self.path)
-            path = url.path
-            get_params = parse_qs(url.query) or {}
-
-
-            if self.command == "POST":
                 content_length = int(self.headers['Content-Length'])
                 post_data = self.rfile.read(content_length)
-                post_params = post_data# parse_qs(post_data.decode('utf-8'))
-            else:
-                post_params = {}
+            except (TypeError, ValueError):
+                print("POST request without valid Content-Length.")
+                pass
 
 
-            # Find the server with the lowest number of queue entries.
-            min_queued_server = servers[0]
-            for server in servers:
-                cs = server[1]
-                if cs['queue'].qsize() < min_queued_server[1]['queue'].qsize():
-                    min_queued_server = server
+        if not SERVERS_CONFIG:
+            print("No backend servers configured. Cannot proxy request.")
+            self.send_response(503)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Service Unavailable: No backend servers configured."}).encode('utf-8'))
+            self.add_access_log_entry(event='error', user=self.user, ip_address=client_ip, access="Denied", server="None", nb_queued_requests_on_server=-1, error="No backend servers")
+            return
 
-            # Apply the queuing mechanism only for a specific endpoint.
-            if path == '/api/generate' or path == '/api/chat' or path == '/v1/chat/completions':
-                que = min_queued_server[1]['queue']
-                client_ip, client_port = self.client_address
-                self.add_access_log_entry(event="gen_request", user=self.user, ip_address=client_ip, access="Authorized", server=min_queued_server[0], nb_queued_requests_on_server=que.qsize())
-                que.put_nowait(1)
-                try:
-                    post_data_dict = {}
+        min_queued_server = SERVERS_CONFIG[0]
+        for server_entry in SERVERS_CONFIG:
+            cs = server_entry[1]
+            if cs['queue'].qsize() < min_queued_server[1]['queue'].qsize():
+                min_queued_server = server_entry
 
-                    if isinstance(post_data, bytes):
+        if path == '/api/generate' or path == '/api/chat' or path == '/v1/chat/completions':
+            que = min_queued_server[1]['queue']
+            self.add_access_log_entry(event="gen_request", user=self.user, ip_address=client_ip, access="Authorized", server=min_queued_server[0], nb_queued_requests_on_server=que.qsize())
+            que.put_nowait(1)
+            try:
+                post_data_dict = {}
+                is_streaming = False
+                if post_data:
+                    try:
                         post_data_str = post_data.decode('utf-8')
                         post_data_dict = json.loads(post_data_str)
+                        is_streaming = post_data_dict.get("stream", False)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as json_err:
+                        print(f"Could not parse POST data as JSON for {path}: {json_err}")
 
-                    response = requests.request(self.command, min_queued_server[1]['url'] + path, params=get_params, data=post_params, stream=post_data_dict.get("stream", False))
-                    self._send_response(response)
-                except Exception as ex:
-                    self.add_access_log_entry(event="gen_error",user=self.user, ip_address=client_ip, access="Authorized", server=min_queued_server[0], nb_queued_requests_on_server=que.qsize(),error=ex)                    
-                finally:
-                    que.get_nowait()
-                    self.add_access_log_entry(event="gen_done",user=self.user, ip_address=client_ip, access="Authorized", server=min_queued_server[0], nb_queued_requests_on_server=que.qsize())                    
-            else:
-                # For other endpoints, just mirror the request.
-                response = requests.request(self.command, min_queued_server[1]['url'] + path, params=get_params, data=post_params)
+                response = requests.request(
+                    self.command,
+                    min_queued_server[1]['url'] + path,
+                    params=get_params,
+                    data=post_data,
+                    headers={k: v for k, v in self.headers.items() if k.lower() not in ['host', 'connection', 'content-length']}, # Forward relevant headers
+                    stream=is_streaming
+                )
                 self._send_response(response)
+            except requests.exceptions.RequestException as ex:
+                print(f"Proxy request to {min_queued_server[0]} failed: {ex}")
+                self.add_access_log_entry(event="gen_error",user=self.user, ip_address=client_ip, access="Authorized", server=min_queued_server[0], nb_queued_requests_on_server=que.qsize(),error=str(ex))
+                self.send_response(502) # Bad Gateway
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Bad Gateway: Upstream server request failed"}).encode('utf-8'))
+            except Exception as ex_other: # Catch any other unexpected error
+                print(f"Unexpected error during proxy to {min_queued_server[0]}: {ex_other}")
+                self.add_access_log_entry(event="gen_error",user=self.user, ip_address=client_ip, access="Authorized", server=min_queued_server[0], nb_queued_requests_on_server=que.qsize(),error=str(ex_other))
+                self.send_response(500) # Internal Server Error
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Internal Server Error"}).encode('utf-8'))
+            finally:
+                if not que.empty(): # Ensure queue is not empty before get
+                    que.get_nowait()
+                else:
+                    print(f"Attempted to get from an empty queue for server {min_queued_server[0]}. This might indicate a logic error.")
+                self.add_access_log_entry(event="gen_done",user=self.user, ip_address=client_ip, access="Authorized", server=min_queued_server[0], nb_queued_requests_on_server=que.qsize())
+        else:
+            try:
+                response = requests.request(
+                    self.command,
+                    min_queued_server[1]['url'] + path,
+                    params=get_params,
+                    data=post_data, # Send raw bytes
+                    headers={k: v for k, v in self.headers.items() if k.lower() not in ['host', 'connection', 'content-length']}
+                )
+                self._send_response(response)
+            except requests.exceptions.RequestException as ex:
+                print(f"Proxy request to {min_queued_server[0]} for non-gen endpoint failed: {ex}")
+                self.send_response(502)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Bad Gateway: Upstream server request failed"}).encode('utf-8'))
+            except Exception as ex_other: # Catch any other unexpected error
+                print(f"Unexpected error during proxy (non-gen) to {min_queued_server[0]}: {ex_other}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Internal Server Error"}).encode('utf-8'))
 
-    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-        pass
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    pass
+
+def start_proxy_server(port, request_handler_class):
+    """Starts the HTTP proxy server."""
+    try:
+        proxy_server = ThreadedHTTPServer(('', port), request_handler_class)
+        print(f'Running Ollama proxy server on port {port}')
+        proxy_server.serve_forever()
+    except OSError as e:
+        print(f"Could not start proxy server on port {port}: {e}")
+        print("The port might be already in use.")
+    except Exception as e:
+        print(f"An unexpected error occurred while starting the proxy server: {e}")
 
 
-    print('Starting server')
-    server = ThreadedHTTPServer(('', args.port), RequestHandler)  # Set the entry port here.
-    print(f'Running server on port {args.port}')
-    server.serve_forever()
+def main():
+    global SERVERS_CONFIG, AUTHORIZED_USERS, CONFIG_FILE_PATH, USERS_FILE_PATH, LOG_FILE_PATH, DEACTIVATE_SECURITY
+
+    parser = argparse.ArgumentParser(description="Ollama Proxy Server with Security and Load Balancing")
+    parser.add_argument('--config', default="config.ini", help='Path to the server configuration file (default: config.ini)')
+    parser.add_argument('--log_path', default="access_log.txt", help='Path to the access log file (default: access_log.txt)')
+    parser.add_argument('--users_list', default="authorized_users.txt", help='Path to the authorized users list file (default: authorized_users.txt)')
+    parser.add_argument('--models', default="models.txt", help='Models available on all workers (default: models.txt)')
+    parser.add_argument('--port', type=int, default=8000, help='Port number for the proxy server (default: 8000)')
+    parser.add_argument('--gui_port', type=int, default=7860, help='Port number for the Gradio GUI (default: 7860)')
+    parser.add_argument('-d', '--deactivate_security', action='store_true', help='Deactivates security layer (USE WITH CAUTION)')
+    parser.add_argument('--no-gui', action='store_true', help='Do not launch the Gradio GUI')
+    args = parser.parse_args()
+
+    CONFIG_FILE_PATH = args.config
+    USERS_FILE_PATH = args.users_list
+    LOG_FILE_PATH = args.log_path
+    DEACTIVATE_SECURITY = args.deactivate_security
+    MODELS_FILE_PATH = args.models
+
+    SERVERS_CONFIG = get_config(CONFIG_FILE_PATH)
+    AUTHORIZED_USERS = get_authorized_users(USERS_FILE_PATH)
+
+    if DEACTIVATE_SECURITY:
+        print("WARNING: Security layer is DEACTIVATED. All requests will be allowed without authentication.")
+
+    print("Ollama Proxy server")
+
+    print(f"Configuration file: {CONFIG_FILE_PATH}")
+    print(f"Users list file: {USERS_FILE_PATH}")
+    print(f"Log file: {LOG_FILE_PATH}")
+
+    proxy_thread = threading.Thread(target=start_proxy_server, args=(args.port, RequestHandler), daemon=True)
+    proxy_thread.start()
+
+    if not args.no_gui and GUI_AVAILABLE:
+
+        launch_gui(args.gui_port,
+                   SERVERS_CONFIG,
+                   LOG_FILE_PATH,
+                   MODELS_FILE_PATH)
+
+    if (args.no_gui or not GUI_AVAILABLE) and proxy_thread.is_alive():
+        try:
+            while proxy_thread.is_alive():
+                proxy_thread.join(timeout=1)
+        except KeyboardInterrupt:
+            print("\nShutdown signal received. Exiting.")
+        finally:
+            print("Ollama Proxy Server shut down.")
+
 
 if __name__ == "__main__":
     main()
